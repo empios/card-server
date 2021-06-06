@@ -1,8 +1,10 @@
 const _ = require('lodash');
 const cardService = require('./cardService');
 const Table = require('../models/table');
+const UserStats = require('../models/userStats');
 const moongosee = require('mongoose');
 const deckService = require('./deckService');
+const userService = require('./userService');
 
 const numOfHand = 10;
 
@@ -32,10 +34,10 @@ let self = module.exports = {
 		let tableToReturn;
 		try{
 			//chekc is arleady StartedGame
-			const startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }]});
+			const startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }],status:'ongoing'});
 			if(_.isEmpty(startedGame)){
 			// check is freeTable
-				const freeTables = await Table.find({playerTwo:null});
+				const freeTables = await Table.find({playerTwo:null,status:'ongoing'});
 				const playerOneHand = await deckService.drawHand(user,numOfHand);
 				if(_.isEmpty(freeTables)){
 					let table = new Table({
@@ -44,7 +46,8 @@ let self = module.exports = {
 						playerOneSocket:socketId,
 						round:1,
 						playerTurn:user,
-						playerOneHand:playerOneHand
+						playerOneHand:playerOneHand,
+						status:'ongoing'
 					});
 					table = await table.save();
 					tableToReturn = table;
@@ -72,7 +75,7 @@ let self = module.exports = {
 	},
 
 	putCard: async(clientData,user)=>{
-		let table = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }]});
+		let table = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }],status:'ongoing'});
 		if(table.playerTurn.toString()!==user._id.toString()){
 			throw 'Is not your turn';
 		}
@@ -87,14 +90,6 @@ let self = module.exports = {
 		const isOnHand = await self.isCardOnHand(user,cardId);
 		if(isOnHand){
 			try {
-				// if(card.buffed){
-				// 	card.power = card.power+10;
-				// 	card.buffed = false;
-				// }
-				// if(card.deBuff){
-				// 	card.power = card.power-10;
-				// 	card.deBuff = false;
-				// }
 				if (table[fieldId] && table[fieldId]?.length > 0) {
 					table[fieldId].push(card);
 				}
@@ -103,15 +98,11 @@ let self = module.exports = {
 				}
 				table[fieldId] = _.sortBy(table[fieldId], ['x']);
 				table[fieldId] = await self.updatePostionOnLine(table[fieldId],clientData.field,card.deckId,card.buffed,card.deBuff);
-				if(isPlayerOne){
-					table.playerTurn=table.playerTwo;
-				}else{
-					table.playerTurn=table.playerOne;
-				}
-				// table = await Table.findOneAndUpdate({_id:table._id},table);
+				await self.saveLines(table,fieldId);
 				await self.removeCardFromHand(cardId,isPlayerOne,table);
+				await self.switchRound(table._id);
 			} catch (err) {
-				console.log(err.message);
+				console.log('Put Card ERR',err.message);
 				throw 'Put Card ERR';
 			}
 		}else{
@@ -169,13 +160,13 @@ let self = module.exports = {
 	},
 
 	getLines: async(userId)=>{
-		const startedGame = await Table.findOne({ $or: [{ playerOne:userId },{ playerTwo:userId }]});
+		const startedGame = await Table.findOne({ $or: [{ playerOne:userId },{ playerTwo:userId }],status:'ongoing'});
 		const isPlayerOne = self.isPlayerOne(userId,startedGame);
 		return self.getLinesOnly(startedGame,isPlayerOne);
 	},
 
 	getTable: async(user)=>{
-		const startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }]}).populate(['playerOneHand','playerTwoHand']);
+		const startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }],status:'ongoing'}).populate(['playerOneHand','playerTwoHand']);
 		return startedGame;
 	},
 
@@ -191,7 +182,7 @@ let self = module.exports = {
 	},
 
 	removeFromTable: async(user)=>{
-		let startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }]});
+		let startedGame = await Table.findOne({ $or: [{ playerOne:user },{ playerTwo:user }],status:'ongoing'});
 		const isPlayerOne = await self.isPlayerOne(user._id, startedGame);
 		if(isPlayerOne){
 			startedGame = await Table.findOneAndUpdate({_id:startedGame._id},{playerOneSocket:null},{returnOriginal:false});
@@ -202,7 +193,7 @@ let self = module.exports = {
 	},
 
 	getHand: async(user)=>{
-		const startedGame = await Table.findOne({ $or: [{ playerOne:user._id },{ playerTwo:user._id }]}).populate(['playerOneHand','playerTwoHand']);
+		const startedGame = await Table.findOne({ $or: [{ playerOne:user._id },{ playerTwo:user._id }],status:'ongoing'}).populate(['playerOneHand','playerTwoHand']);
 		const isPlayerOne = self.isPlayerOne(user._id,startedGame);
 		if(isPlayerOne){
 			return startedGame.playerOneHand;
@@ -217,23 +208,25 @@ let self = module.exports = {
 	},
 
 	removeCardFromHand: async(cardId,isPlayerOne,table)=>{
+		//TODO remove only one from hand
 		if(isPlayerOne){
-			table.playerOneHand = table.playerOneHand.filter(card=>card._id.toString() !== cardId.toString());
-			await Table.findOneAndUpdate({_id:table.id},table);
+			let playerOneHand = table.playerOneHand.filter(card=>card._id.toString() !== cardId.toString());
+			await Table.findOneAndUpdate({_id:table.id},{playerOneHand:playerOneHand});
 		}else{
-			table.playerTwoHand = table.playerTwoHand.filter(card=>card._id.toString() !== cardId.toString());
-			await Table.findOneAndUpdate({_id:table.id},table);
+			let playerTwoHand = table.playerTwoHand.filter(card=>card._id.toString() !== cardId.toString());
+			await Table.findOneAndUpdate({_id:table.id},{playerTwoHand:playerTwoHand});
 		}
 	},
 
 	isUserMoved: async(table)=>{
 		//TODO check is round this same
-		const isPlayerOne = await self.isPlayerOne(table.playerTurn,table);
-		if(isPlayerOne){
+		let actualTable = await self.getTableById(table._id);
+		const isPlayerOne = self.isPlayerOne(table.playerTurn,table);
+		if(isPlayerOne && !actualTable?.playerOnePassed){
 			const oldHand = table.playerOneHand;
 			const newHand = await self.getHand(table.playerOne);
 			return oldHand?.length > newHand?.length;
-		}else{
+		}else if(!actualTable?.playerTwoPassed){
 			const oldHand = table.playerTwoHand;
 			const newHand = await self.getHand(table.playerTwo);
 			return oldHand?.length > newHand?.length;
@@ -242,5 +235,194 @@ let self = module.exports = {
 
 	getTableById: async(tableId)=>{
 		return Table.findOne({_id:tableId});
+	},
+
+	passRound: async(user)=>{
+		let table = await self.getTable(user);
+		const isPlayerOne = self.isPlayerOne(user?._id,table);
+		if(isPlayerOne && table.playerTwoPassed){
+			await Table.findOneAndUpdate({_id:table._id},{playerOnePassed:true});
+		}else if(isPlayerOne && !table.playerTwoPassed){
+			await self.switchRound(table._id);
+			await Table.findOneAndUpdate({_id:table._id},{playerOnePassed:true});
+		}else if(!isPlayerOne && table.playerTwoPassed){
+			await Table.findOneAndUpdate({_id:table._id},{playerTwoPassed:true});
+		}else if(!isPlayerOne && !table.playerTwoPassed){
+			await self.switchRound(table._id);
+			await Table.findOneAndUpdate({_id:table._id},{playerTwoPassed:true});
+		}
+		return self.checkWhoWin(table?._id);
+	},
+
+	switchRound: async(tableId)=>{
+		let table = await Table.findOne({_id:tableId});
+		if(table.playerOne.toString() == table.playerTurn.toString() && !table.playerTwoPassed){
+			table.playerTurn = table.playerTwo;
+		}else if(!table.playerOnePassed){
+			table.playerTurn = table.playerOne;
+		}
+		await Table.findOneAndUpdate({_id:tableId},{playerTurn:table.playerTurn});
+	},
+
+	isMyRound: async(user)=>{
+		const table = await self.getTable(user);
+		const isPlayerOne = self.isPlayerOne(user._id,table);
+		let isMyRound=false;
+		if(isPlayerOne){
+			isMyRound = table.playerTurn.toString() === user?._id.toString() && !table.playerOnePassed;
+		}else{
+			isMyRound = table.playerTurn.toString() === user?._id.toString() && !table.playerTwoPassed;
+		}
+		return isMyRound;
+	},
+
+	saveLines: async(table,fieldName)=>{
+		let oldTable = await Table.findOne({_id:table._id});
+		oldTable[fieldName] = table[fieldName];
+		await Table.findOneAndUpdate({_id:table._id},oldTable);
+	},
+
+	isGameRunning: async(user)=>{
+		const table = await self.getTable(user);
+		if(table.playerOneSocket && table.playerTwoSocket){
+			return true;
+		}else{
+			return false;
+		}
+	},
+
+	getCurrentPlayerSocket: async(tableId)=>{
+		const table = await Table.findOne({_id:tableId});
+		const isPlayerOne = self.isPlayerOne(table.playerTurn,table);
+		if(isPlayerOne){
+			return table.playerOneSocket;
+		}else{
+			return table.playerTwoSocket;
+		}
+	},
+
+	checkWhoWin: async(tableId)=>{
+		//TODO create new service
+		let gameInfo = {
+			sendRoundInfo:false,
+			sendWinInfo: false,
+			isDrawOfRound:false,
+			isDrawOfGame:false,
+			isPlayerOneWonRound:false,
+			isPlayerTwoWonRound:false,
+			isPlayerOneWonGame:false,
+			isPlayerTwoWonGame:false
+		};
+		let table = await self.getTableById(tableId);
+		if(table.status=='ended'){
+			console.log('Game arldedy Ended');
+		}
+		if(table.playerOnePassed && table.playerTwoPassed){
+
+			gameInfo.sendRoundInfo = true;
+
+			let lines = self.getLinesOnly(table,true);
+			lines = lines.map((line)=>{
+				let poweOfLine = line.map(card=>{
+					return card.power+card.shield;
+				});
+				poweOfLine = _.isEmpty(poweOfLine) ? 0 : poweOfLine.reduce( (a,c)=> a+c);
+				return poweOfLine;
+			});
+			let playerOnePoints = lines[0] + lines[1];
+			let playerTwoPoints = lines[2] + lines[3];
+			let playerWin=[];
+			if(playerOnePoints == playerTwoPoints){
+				//0 for draw
+				playerWin = 0;
+				gameInfo.isDrawOfRound = true;
+			}else if(playerOnePoints > playerTwoPoints){
+				playerWin = 1;
+				gameInfo.isPlayerOneWonRound = true;
+			}else{
+				playerWin = 2;
+				gameInfo.isPlayerTwoWonRound = true;
+			}
+			if(_.isEmpty(table.roundStates)){
+				table.roundStates = [playerWin];
+			}else{
+				table.roundStates.push(playerWin);
+			}
+			await self.switchRound(table?._id);
+			table = await Table.findOneAndUpdate(
+				{_id:table._id},
+				{
+					roundStates:table.roundStates,
+					round:table.round+1,
+					playerOnePassed:false,
+					playerTwoPassed:false,
+					lineOne:[],
+					lineTwo:[],
+					lineThree:[],
+					lineFour:[],
+
+				}
+				,{returnOriginal:false});
+		}
+		const {
+			isPlayerOneWonGame,
+			isPlayerTwoWonGame,
+			isDrawOfGame,
+			sendWinInfo
+		} = await self.whoWinGame(table);
+
+		gameInfo.isPlayerOneWonGame=isPlayerOneWonGame;
+		gameInfo.isPlayerTwoWonGame=isPlayerTwoWonGame;
+		gameInfo.isDrawOfGame=isDrawOfGame;
+		gameInfo.sendWinInfo=sendWinInfo;
+		return gameInfo;
+	},
+	whoWinGame: async(table)=>{
+		let gameInfo = {
+			isPlayerOneWonGame:false,
+			isPlayerTwoWonGame:false,
+			isDrawOfGame:false,
+			sendWinInfo:false
+		};
+		let playerOneRounds = table.roundStates.filter(p => p==1 || p==0);
+		playerOneRounds = playerOneRounds?.length;
+		let playerTwoRounds = table.roundStates.filter(p => p==2 || p==0);
+		playerTwoRounds = playerTwoRounds?.length;
+		if(playerOneRounds >=2 || playerTwoRounds>=2){
+
+			gameInfo.sendWinInfo = true;
+			let gameStatus = '';
+			if(playerOneRounds==playerTwoRounds){
+				gameInfo.isDrawOfGame = true;
+				gameStatus='draw';
+			}else if(playerOneRounds>playerTwoRounds){
+				gameInfo.isPlayerOneWonGame = true;
+				gameStatus='p1';
+			}else{
+				gameInfo.isPlayerTwoWonGame = true;
+				gameStatus='p2';
+			}
+			//save to DB
+			switch (gameStatus) {
+			case 'draw':
+				await userService.updateScore(table.playerOne,5);
+				await userService.updateScore(table.playerTwo,5);
+				break;
+			case 'p1':
+				await userService.updateScore(table.playerOne,10);
+				await userService.updateScore(table.playerTwo,-5);
+				break;
+			case 'p2':
+				await userService.updateScore(table.playerOne,-5);
+				await userService.updateScore(table.playerTwo,10);
+				break;
+			default:
+				console.log(`Can't save this status: ${gameStatus}.`);
+			}
+			await UserStats.create({_id: new moongosee.Types.ObjectId(),table:table._id,users:[table.playerOne,table.playerTwo],status:gameStatus});
+			await Table.updateOne({_id:table._id},{status:'ended',result:gameStatus});
+		}
+		return gameInfo;
 	}
+
 };
